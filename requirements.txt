@@ -1,0 +1,12 @@
+pandas
+geopandas
+shapely
+pyproj
+pyogrio
+matplotlib
+seaborn
+mapclassify
+contextily
+jupyter
+notebook
+ipykernel
