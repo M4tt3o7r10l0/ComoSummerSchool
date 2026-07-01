@@ -2,3 +2,6 @@ data/*
 data/
 data
 __pycache__/*
+outputs/*
+outputs/
+outputs

@@ -1,733 +1,371 @@
 #%%
-import numpy as np
+from pathlib import Path
+
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
-import geopandas as gpd
-import re
-import unicodedata
-from xml.etree import ElementTree as ET
-from zipfile import ZipFile
+import seaborn as sns
+import statsmodels.api as sm
 
-DATA = 'data/'
-
-# %%
-data = gpd.read_file(
-    DATA+'limiti_comunali_2020.geojson'
-)
-data = data.drop(columns='anno')
-data.head()
-
-# %%
-data.plot()
-
-#%%
-istat = pd.read_csv(DATA + 'istat_codes.csv', sep=';')
-istat = istat[istat['Regione'] == 'Lombardia']
-istat
-
-# %%
-redd = pd.read_csv(DATA + 'Redditi/2011/comunali.csv', sep=';', index_col=False)
-redd = redd[redd['Regione'] == 'Lombardia']
-redd.head()
-
-# %%
-len(redd)
-
-#%%
-def _normalize_text(value: str) -> str:
-    value = unicodedata.normalize('NFKD', str(value))
-    value = value.encode('ascii', 'ignore').decode('ascii')
-    return ' '.join(value.strip().lower().split())
+from merge_data import merge_geodata_omi_redditi_votes_2021
 
 
-def _normalize_join_key(value: str) -> str:
-    value = unicodedata.normalize('NFKD', str(value))
-    value = value.encode('ascii', 'ignore').decode('ascii').lower().strip()
-    return re.sub(r'[^a-z0-9]+', '', value)
+OUTPUT_DIR = Path('outputs')
+OUTPUT_DIR.mkdir(exist_ok=True)
+BOOTSTRAP_RANDOM_SEED = 42
+BOOTSTRAP_SAMPLES = 5000
+
+sns.set_theme(style='white', context='notebook')
+
+ANALYSIS_COLUMNS = {
+    'Voti si': 'yes_votes',
+    'Voti validi': 'valid_votes',
+    'Affluenza referendum 2026': 'turnout_referendum_2026',
+    'Affluenza politiche 2022': 'turnout_politiche_2022',
+    'Affluenza politiche 2022 male': 'turnout_politiche_2022_male',
+    'Affluenza politiche 2022 female': 'turnout_politiche_2022_female',
+    'Perc voti si': 'referendum_yes',
+    'Perc voti no': 'referendum_no',
+    'Perc voti coalizione - CENTRODESTRA': 'center_right',
+    'Perc voti coalizione - CENTROSINISTRA': 'center_left',
+    'Perc voti coalizione - M5S': 'm5s',
+    'Perc voti coalizione - TERZO_POLO': 'third_pole',
+    'Perc voti coalizione - ALTRI': 'others',
+    'avg_income': 'avg_income',
+    'price_m2': 'house_price_m2',
+    'rent_m2': 'house_rent_m2',
+    'population_2021': 'population_2021',
+    'distance_to_milano_km': 'distance_to_milano_km',
+}
+
+PLOT_COLUMNS = [
+    'referendum_yes',
+    'referendum_no',
+    'turnout_referendum_2026',
+    'turnout_politiche_2022',
+    'turnout_politiche_2022_male',
+    'turnout_politiche_2022_female',
+    'center_right',
+    'center_left',
+    'm5s',
+    'third_pole',
+    'others',
+    'avg_income',
+    'house_price_m2',
+    'house_rent_m2',
+    'distance_to_milano_km',
+]
+
+DISPLAY_LABELS = {
+    'referendum_yes': 'yes_ref',
+    'referendum_no': 'no_ref',
+    'turnout_referendum_2026': 'turnout_ref26',
+    'turnout_politiche_2022': 'turnout_pol22',
+    'turnout_politiche_2022_male': 'turnout_male22',
+    'turnout_politiche_2022_female': 'turnout_female22',
+    'center_right': 'center_right',
+    'center_left': 'center_left',
+    'm5s': 'm5s',
+    'third_pole': 'third_pole',
+    'others': 'others',
+    'avg_income': 'avg_income',
+    'house_price_m2': 'price_m2',
+    'house_rent_m2': 'rent_m2',
+    'distance_to_milano_km': 'dist_milan_km',
+}
 
 
-def _normalize_redditi_column_name(column: str) -> str:
-    column = _normalize_text(column)
-    column = column.replace('(compresi valori nulli)', '(comprensivo dei valori nulli)')
-    column = column.replace('semplificata(', 'semplificata (')
-    column = column.replace('ammontare in euro', 'ammontare')
-    column = column.replace("contabilita'", 'contabilita')
-    column = column.replace('reddito imponibile addizionale irpef', 'reddito imponibile addizionale')
-    return column
+def build_analysis_df(region: str = 'Lombardia') -> pd.DataFrame:
+    df = merge_geodata_omi_redditi_votes_2021(region=region).copy()
+    df = df.rename(columns=ANALYSIS_COLUMNS)
+
+    keep_columns = ['Comune'] + list(ANALYSIS_COLUMNS.values())
+    analysis_df = df[keep_columns].copy()
+    analysis_df = analysis_df.dropna(subset=PLOT_COLUMNS)
+    analysis_df = analysis_df[analysis_df['valid_votes'] > 0].copy()
+    return analysis_df
 
 
-def read_redditi(year: int | str, region: str = 'Lombardia') -> pd.DataFrame:
-    canonical_columns = {
-        'anno di imposta': 'Anno di imposta',
-        'codice catastale': 'Codice catastale',
-        'codice istat': 'Codice Istat Comune',
-        'codice istat comune': 'Codice Istat Comune',
-        'denominazione comune': 'Denominazione Comune',
-        'sigla provincia': 'Sigla Provincia',
-        'regione': 'Regione',
-        'codice istat regione': 'Codice Istat Regione',
-        'numero contribuenti': 'Numero contribuenti',
-        'reddito da fabbricati - frequenza': 'Reddito da fabbricati - Frequenza',
-        'reddito da fabbricati - ammontare': 'Reddito da fabbricati - Ammontare in euro',
-        'reddito da lavoro dipendente e assimilati - frequenza': 'Reddito da lavoro dipendente e assimilati - Frequenza',
-        'reddito da lavoro dipendente e assimilati - ammontare': 'Reddito da lavoro dipendente e assimilati - Ammontare in euro',
-        'reddito da pensione - frequenza': 'Reddito da pensione - Frequenza',
-        'reddito da pensione - ammontare': 'Reddito da pensione - Ammontare in euro',
-        'reddito da lavoro autonomo (comprensivo dei valori nulli) - frequenza': 'Reddito da lavoro autonomo (comprensivo dei valori nulli) - Frequenza',
-        'reddito da lavoro autonomo (comprensivo dei valori nulli) - ammontare': 'Reddito da lavoro autonomo (comprensivo dei valori nulli) - Ammontare in euro',
-        "reddito di spettanza dell'imprenditore in contabilita ordinaria (comprensivo dei valori nulli) - frequenza": "Reddito di spettanza dell'imprenditore in contabilita ordinaria (comprensivo dei valori nulli) - Frequenza",
-        "reddito di spettanza dell'imprenditore in contabilita ordinaria (comprensivo dei valori nulli) - ammontare": "Reddito di spettanza dell'imprenditore in contabilita ordinaria (comprensivo dei valori nulli) - Ammontare in euro",
-        "reddito di spettanza dell'imprenditore in contabilita semplificata (comprensivo dei valori nulli) - frequenza": "Reddito di spettanza dell'imprenditore in contabilita semplificata (comprensivo dei valori nulli) - Frequenza",
-        "reddito di spettanza dell'imprenditore in contabilita semplificata (comprensivo dei valori nulli) - ammontare": "Reddito di spettanza dell'imprenditore in contabilita semplificata (comprensivo dei valori nulli) - Ammontare in euro",
-        'reddito da partecipazione (comprensivo dei valori nulli) - frequenza': 'Reddito da partecipazione (comprensivo dei valori nulli) - Frequenza',
-        'reddito da partecipazione (comprensivo dei valori nulli) - ammontare': 'Reddito da partecipazione (comprensivo dei valori nulli) - Ammontare in euro',
-        'reddito imponibile - frequenza': 'Reddito imponibile - Frequenza',
-        'reddito imponibile - ammontare': 'Reddito imponibile - Ammontare in euro',
-        'imposta netta - frequenza': 'Imposta netta - Frequenza',
-        'imposta netta - ammontare': 'Imposta netta - Ammontare in euro',
-        'bonus spettante - frequenza': 'Bonus spettante - Frequenza',
-        'bonus spettante - ammontare': 'Bonus spettante - Ammontare in euro',
-        'trattamento spettante - frequenza': 'Trattamento spettante - Frequenza',
-        'trattamento spettante - ammontare': 'Trattamento spettante - Ammontare in euro',
-        'reddito imponibile addizionale - frequenza': 'Reddito imponibile addizionale - Frequenza',
-        'reddito imponibile addizionale - ammontare': 'Reddito imponibile addizionale - Ammontare in euro',
-        'addizionale regionale dovuta - frequenza': 'Addizionale regionale dovuta - Frequenza',
-        'addizionale regionale dovuta - ammontare': 'Addizionale regionale dovuta - Ammontare in euro',
-        'addizionale comunale dovuta - frequenza': 'Addizionale comunale dovuta - Frequenza',
-        'addizionale comunale dovuta - ammontare': 'Addizionale comunale dovuta - Ammontare in euro',
-        'reddito complessivo minore o uguale a zero euro - frequenza': 'Reddito complessivo minore o uguale a zero euro - Frequenza',
-        'reddito complessivo minore o uguale a zero euro - ammontare': 'Reddito complessivo minore o uguale a zero euro - Ammontare in euro',
-        'reddito complessivo da 0 a 10000 euro - frequenza': 'Reddito complessivo da 0 a 10000 euro - Frequenza',
-        'reddito complessivo da 0 a 10000 euro - ammontare': 'Reddito complessivo da 0 a 10000 euro - Ammontare in euro',
-        'reddito complessivo da 10000 a 15000 euro - frequenza': 'Reddito complessivo da 10000 a 15000 euro - Frequenza',
-        'reddito complessivo da 10000 a 15000 euro - ammontare': 'Reddito complessivo da 10000 a 15000 euro - Ammontare in euro',
-        'reddito complessivo da 15000 a 26000 euro - frequenza': 'Reddito complessivo da 15000 a 26000 euro - Frequenza',
-        'reddito complessivo da 15000 a 26000 euro - ammontare': 'Reddito complessivo da 15000 a 26000 euro - Ammontare in euro',
-        'reddito complessivo da 26000 a 55000 euro - frequenza': 'Reddito complessivo da 26000 a 55000 euro - Frequenza',
-        'reddito complessivo da 26000 a 55000 euro - ammontare': 'Reddito complessivo da 26000 a 55000 euro - Ammontare in euro',
-        'reddito complessivo da 55000 a 75000 euro - frequenza': 'Reddito complessivo da 55000 a 75000 euro - Frequenza',
-        'reddito complessivo da 55000 a 75000 euro - ammontare': 'Reddito complessivo da 55000 a 75000 euro - Ammontare in euro',
-        'reddito complessivo da 75000 a 120000 euro - frequenza': 'Reddito complessivo da 75000 a 120000 euro - Frequenza',
-        'reddito complessivo da 75000 a 120000 euro - ammontare': 'Reddito complessivo da 75000 a 120000 euro - Ammontare in euro',
-        'reddito complessivo oltre 120000 euro - frequenza': 'Reddito complessivo oltre 120000 euro - Frequenza',
-        'reddito complessivo oltre 120000 euro - ammontare': 'Reddito complessivo oltre 120000 euro - Ammontare in euro',
-    }
+def write_excel_with_fallback(sheets: dict[str, pd.DataFrame], output_path: Path) -> Path:
+    try:
+        with pd.ExcelWriter(output_path) as writer:
+            for sheet_name, df in sheets.items():
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+        return output_path
+    except PermissionError:
+        fallback_path = output_path.with_stem(output_path.stem + '_updated')
+        with pd.ExcelWriter(fallback_path) as writer:
+            for sheet_name, df in sheets.items():
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+        return fallback_path
 
-    year = str(year)
-    target_region = _normalize_text(region)
-    redd = pd.read_csv(
-        DATA + f'Redditi/{year}/comunali.csv',
-        sep=';',
-        index_col=False,
-        encoding='latin1',
-        low_memory=False,
-        dtype={
-            'Codice catastale': 'string',
-            'Codice Istat': 'string',
-            'Codice Istat Comune': 'string',
-            'Codice Istat Regione': 'string',
-            'Sigla Provincia': 'string',
-            'Regione': 'string',
-            'Denominazione Comune': 'string',
-        },
+
+def gini_coefficient(values: pd.Series | np.ndarray) -> float:
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    if array.size == 0:
+        return np.nan
+    if np.any(array < 0):
+        raise ValueError('Gini requer valores nao negativos.')
+    if np.allclose(array.sum(), 0):
+        return 0.0
+
+    sorted_array = np.sort(array)
+    n = sorted_array.size
+    index = np.arange(1, n + 1)
+    return float((2 * np.sum(index * sorted_array) / (n * sorted_array.sum())) - (n + 1) / n)
+
+
+def bootstrap_gini(
+    values: pd.Series | np.ndarray,
+    n_bootstrap: int = BOOTSTRAP_SAMPLES,
+    random_seed: int = BOOTSTRAP_RANDOM_SEED,
+) -> np.ndarray:
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    rng = np.random.default_rng(random_seed)
+    sample_size = array.size
+    bootstrap_estimates = np.empty(n_bootstrap, dtype=float)
+
+    for i in range(n_bootstrap):
+        sample = rng.choice(array, size=sample_size, replace=True)
+        bootstrap_estimates[i] = gini_coefficient(sample)
+
+    return bootstrap_estimates
+
+
+def plot_correlation_triangle(
+    analysis_df: pd.DataFrame,
+    columns: list[str],
+    output_path: Path,
+    method: str = 'pearson',
+    title: str = 'Triangular Correlation Matrix',
+    cbar_label: str = 'Correlation',
+) -> pd.DataFrame:
+    corr = analysis_df[columns].corr(method=method)
+    mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
+    corr_plot = corr.rename(index=DISPLAY_LABELS, columns=DISPLAY_LABELS)
+
+    fig, ax = plt.subplots(figsize=(14, 12))
+    sns.heatmap(
+        corr_plot,
+        mask=mask,
+        cmap='RdBu_r',
+        vmin=-1,
+        vmax=1,
+        center=0,
+        annot=True,
+        fmt='.2f',
+        square=True,
+        linewidths=0.5,
+        cbar_kws={'shrink': 0.8, 'label': cbar_label},
+        ax=ax,
     )
+    ax.set_title(title)
+    ax.tick_params(axis='x', rotation=45)
+    ax.tick_params(axis='y', rotation=0)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    return corr
 
-    redd = redd.drop(columns=[col for col in redd.columns if not str(col).strip()], errors='ignore')
-    redd = redd.rename(
-        columns={
-            column: canonical_columns.get(_normalize_redditi_column_name(column), column.strip())
-            for column in redd.columns
+
+def plot_regression_triangle(
+    analysis_df: pd.DataFrame,
+    columns: list[str],
+    output_path: Path,
+) -> None:
+    plot_df = analysis_df[columns].rename(columns=DISPLAY_LABELS)
+    grid = sns.PairGrid(plot_df, corner=True, height=1.6, diag_sharey=False)
+    grid.map_lower(
+        sns.regplot,
+        scatter_kws={'s': 14, 'alpha': 0.45, 'color': '#1f4e79'},
+        line_kws={'color': '#c0392b', 'linewidth': 1.2},
+        ci=None,
+    )
+    grid.map_diag(sns.histplot, bins=20, color='#4c956c', edgecolor='white')
+    grid.figure.suptitle('Regression Triangle', y=1.02)
+    grid.figure.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(grid.figure)
+
+
+def plot_gini_bootstrap(
+    analysis_df: pd.DataFrame,
+    output_path: Path,
+    summary_path: Path,
+) -> pd.DataFrame:
+    bootstrap_estimates = bootstrap_gini(analysis_df['avg_income'])
+    quartiles = np.quantile(bootstrap_estimates, [0.25, 0.5, 0.75])
+    observed_gini = gini_coefficient(analysis_df['avg_income'])
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.histplot(bootstrap_estimates, bins=40, color='#4c956c', edgecolor='white', ax=ax)
+    ax.axvline(observed_gini, color='#c0392b', linewidth=2, label=f'Observed Gini = {observed_gini:.3f}')
+
+    for quartile, label, color in zip(
+        quartiles,
+        ['Q1', 'Q2 (Median)', 'Q3'],
+        ['#1f4e79', '#7f8c8d', '#f39c12'],
+    ):
+        ax.axvline(quartile, color=color, linestyle='--', linewidth=1.5, label=f'{label} = {quartile:.3f}')
+
+    ax.set_title('Bootstrap Distribution of Gini for Average Income')
+    ax.set_xlabel('Gini coefficient')
+    ax.set_ylabel('Frequency')
+    ax.legend(frameon=True)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig) 
+
+    summary = pd.DataFrame(
+        {
+            'statistic': ['observed_gini', 'q1', 'median', 'q3'],
+            'value': [observed_gini, *quartiles],
         }
     )
-
-    for column in ['Regione', 'Denominazione Comune', 'Sigla Provincia']:
-        if column in redd.columns:
-            redd[column] = redd[column].astype('string').str.strip()
-
-    if 'Regione' in redd.columns:
-        redd['Regione'] = redd['Regione'].str.title()
-        redd = redd[redd['Regione'].map(_normalize_text) == target_region]
-
-    if 'Codice Istat Comune' in redd.columns:
-        redd['Codice Istat Comune'] = redd['Codice Istat Comune'].str.zfill(6)
-
-    if 'Codice Istat Regione' in redd.columns:
-        redd['Codice Istat Regione'] = redd['Codice Istat Regione'].str.zfill(2)
-    else:
-        redd['Codice Istat Regione'] = pd.NA
-
-    canonical_order = list(dict.fromkeys(canonical_columns.values()))
-    remaining_columns = [column for column in redd.columns if column not in canonical_order]
-    return redd.reindex(columns=canonical_order + remaining_columns)
+    summary.to_csv(summary_path, index=False)
+    return summary
 
 
-def read_istat_codes(region: str = 'Lombardia') -> pd.DataFrame:
-    istat = pd.read_csv(DATA + 'istat_codes.csv', sep=';', dtype=str)
-    istat = istat[istat['Regione'].map(_normalize_text) == _normalize_text(region)].copy()
-    istat['Codice Comune (alfanumerico)'] = istat['Codice Comune (alfanumerico)'].astype('string').str.zfill(6)
-    istat['Codice Comune (numerico)'] = istat['Codice Comune (numerico)'].astype('string').str.zfill(5)
-    istat['Codice catasto'] = istat['Codice catasto'].astype('string').str.upper()
-    istat['Sigla automobilistica'] = istat['Sigla automobilistica'].astype('string').str.upper()
-    return istat
-
-
-def read_referendum2026(region: str = 'Lombardia') -> pd.DataFrame:
-    ns = {'a': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
-    with ZipFile(DATA + 'referendum2026.xlsx') as workbook:
-        shared = ET.fromstring(workbook.read('xl/sharedStrings.xml'))
-        shared_strings = [
-            ''.join(text.text or '' for text in item.iterfind('.//a:t', ns))
-            for item in shared.findall('a:si', ns)
-        ]
-        sheet = ET.fromstring(workbook.read('xl/worksheets/sheet1.xml'))
-        rows = sheet.find('a:sheetData', ns)
-
-        values = []
-        for row in rows:
-            row_values = []
-            for cell in row.findall('a:c', ns):
-                value = cell.find('a:v', ns)
-                cell_type = cell.attrib.get('t')
-                if value is None:
-                    row_values.append('')
-                elif cell_type == 's':
-                    row_values.append(shared_strings[int(value.text)])
-                else:
-                    row_values.append(value.text)
-            values.append(row_values)
-
-    referendum = pd.DataFrame(values[1:], columns=values[0])
-    referendum = referendum[referendum['REG'].map(_normalize_text) == _normalize_text(region)].copy()
-    referendum = referendum.rename(
-        columns={
-            'DATAELEZIONE': 'Data elezione',
-            'REG': 'Regione',
-            'PROV': 'Provincia',
-            'COM': 'Comune',
-            'ELETTORITOTALI': 'Elettori totali',
-            'NUMVOTANTITOTALI': 'Votanti totais',
-            'SKBIANCHE': 'Schede bianche',
-            'VOTIVALIDI': 'Voti validi',
-            'VOTISI': 'Voti si',
-        }
-    )
-
-    for column in ['Regione', 'Provincia', 'Comune']:
-        referendum[column] = referendum[column].astype('string').str.strip()
-
-    for column in ['Data elezione', 'Elettori totali', 'Votanti totais', 'Schede bianche', 'Voti validi', 'Voti si']:
-        referendum[column] = pd.to_numeric(referendum[column], errors='coerce')
-
-    referendum['Voti no'] = referendum['Voti validi'] - referendum['Voti si']
-    referendum['Perc voti si'] = referendum['Voti si'] / referendum['Voti validi']
-    referendum['Perc voti no'] = referendum['Voti no'] / referendum['Voti validi']
-
-    referendum['_province_key'] = referendum['Provincia'].map(_normalize_join_key)
-    referendum['_comune_key'] = referendum['Comune'].map(_normalize_join_key)
-
-    istat = read_istat_codes(region=region).copy()
-    istat['_province_key'] = istat['Provincia/Uts'].map(_normalize_join_key)
-    istat['_comune_key'] = istat['Comune'].map(_normalize_join_key)
-
-    referendum = referendum.merge(
-        istat[
-            [
-                '_province_key',
-                '_comune_key',
-                'Codice Comune (alfanumerico)',
-                'Codice Comune (numerico)',
-                'Sigla automobilistica',
-                'Codice catasto',
-                'Provincia/Uts',
-            ]
-        ],
-        how='left',
-        on=['_province_key', '_comune_key'],
-    )
-    referendum = referendum.rename(
-        columns={
-            'Codice Comune (alfanumerico)': 'Codice Istat Comune',
-            'Codice Comune (numerico)': 'Codice Istat Comune numerico',
-            'Sigla automobilistica': 'Sigla Provincia',
-            'Codice catasto': 'Codice catastale',
-            'Provincia/Uts': 'Provincia ISTAT',
-        }
-    )
-    return referendum.drop(columns=['_province_key', '_comune_key'])
-
-
-def read_camera2022(region: str = 'Lombardia') -> pd.DataFrame:
-    comune_aliases = {
-        'ALBAREDO ARNABOLDI': 'CAMPOSPINOSO ALBAREDO',
-        'BARDELLO': 'BARDELLO CON MALGESSO E BREGANO',
-        'BREGANO': 'BARDELLO CON MALGESSO E BREGANO',
-        'CAMPOSPINOSO': 'CAMPOSPINOSO ALBAREDO',
-        'LIRIO': 'COLLI VERDI',
-        'MALGESSO': 'BARDELLO CON MALGESSO E BREGANO',
-        'RONAGO': 'UGGIATE CON RONAGO',
-        'UGGIATE TREVANO': 'UGGIATE CON RONAGO',
-    }
-    coalition_columns = ['CENTRODESTRA', 'CENTROSINISTRA', 'M5S', 'TERZO_POLO', 'ALTRI']
-    excluded_columns = {
-        'COMUNE', 'COMUNE_clean', 'ELETTORITOT', 'ELETTORIM', 'VOTANTITOT', 'VOTANTIM',
-        'SKBIANCHE', 'ELETTORIF', 'VOTANTIF', 'AFFLUENZA', 'AFFLUENZA_M', 'AFFLUENZA_F',
-        'PERC_SCHEDE_BIANCHE', 'TOT_VOTI_LISTA', 'VINCITORE_COALIZIONE',
-        'VOTI_VINCITORE_COALIZIONE', 'PERC_VINCITORE_COALIZIONE', 'VINCITORE_PARTITO',
-        'VOTI_VINCITORE_PARTITO', 'PERC_VINCITORE_PARTITO', 'POLARIZZAZIONE_DX_SX',
-        'CHECK_COALIZIONI',
-    }
-
-    camera = pd.read_csv(DATA + 'camera2022.csv')
-    camera['Comune'] = camera['COMUNE_clean'].fillna(camera['COMUNE']).astype('string').str.strip()
-    camera['Comune ISTAT lookup'] = camera['Comune'].replace(comune_aliases)
-    camera['_comune_key'] = camera['Comune ISTAT lookup'].map(_normalize_join_key)
-
-    for column in camera.columns:
-        if column not in {'COMUNE', 'COMUNE_clean', 'Comune', 'Comune ISTAT lookup', '_comune_key'}:
-            try:
-                camera[column] = pd.to_numeric(camera[column])
-            except (ValueError, TypeError):
-                pass
-
-    numeric_columns = [
-        column for column in camera.columns
-        if column not in {'COMUNE', 'COMUNE_clean', 'Comune', 'Comune ISTAT lookup', '_comune_key'}
-        and pd.api.types.is_numeric_dtype(camera[column])
-    ]
-    camera = (
-        camera.groupby('Comune ISTAT lookup', as_index=False)[numeric_columns]
-        .sum(min_count=1)
-    )
-    camera['Comune'] = camera['Comune ISTAT lookup']
-    camera['_comune_key'] = camera['Comune ISTAT lookup'].map(_normalize_join_key)
-
-    istat = read_istat_codes(region=region).copy()
-    istat['_comune_key'] = istat['Comune'].map(_normalize_join_key)
-    camera = camera.merge(
-        istat[['_comune_key', 'Codice Comune (alfanumerico)', 'Codice catasto']],
-        how='left',
-        on='_comune_key',
-    )
-    camera = camera.rename(
-        columns={
-            'Codice Comune (alfanumerico)': 'Codice Istat Comune',
-            'Codice catasto': 'Codice catastale',
-        }
-    )
-
-    party_columns = [
-        column for column in camera.columns
-        if column not in excluded_columns
-        and column not in coalition_columns
-        and not any(column == f'{coalition}_PERC' for coalition in coalition_columns)
-        and not column.endswith('_PERC')
-        and column not in {'Comune', 'Comune ISTAT lookup', '_comune_key', 'Codice Istat Comune', 'Codice catastale'}
-    ]
-    total_votes = camera['TOT_VOTI_LISTA'].replace({0: np.nan}) if 'TOT_VOTI_LISTA' in camera.columns else pd.Series(np.nan, index=camera.index)
-
-    coalition_pct_columns = []
-    for column in coalition_columns:
-        new_pct_column = f'Perc voti coalizione - {column}'
-        camera[new_pct_column] = camera[column] / total_votes
-        coalition_pct_columns.append(new_pct_column)
-
-    party_pct_columns = []
-    for column in party_columns:
-        new_pct_column = f'Perc voti partito - {column}'
-        camera[new_pct_column] = camera[column] / total_votes
-        party_pct_columns.append(new_pct_column)
-
-    renamed_columns = {column: f'Voti partito - {column}' for column in party_columns}
-    renamed_columns.update({column: f'Voti coalizione - {column}' for column in coalition_columns})
-    camera = camera.rename(columns=renamed_columns)
-
-    keep_columns = (
-        ['Comune', 'Codice Istat Comune', 'Codice catastale', 'VOTANTITOT']
-        + [renamed_columns[column] for column in coalition_columns]
-        + coalition_pct_columns
-        + [renamed_columns[column] for column in party_columns]
-        + party_pct_columns
-    )
-    camera = camera.rename(columns={'VOTANTITOT': 'Votanti totali politiche 2022'})
-    keep_columns[3] = 'Votanti totali politiche 2022'
-    return camera[keep_columns]
-
-#%%
-def read_omi(year: int | str, region: str = 'Lombardia') -> pd.DataFrame:
-    canonical_columns = [
-        'Area territoriale',
-        'Regione',
-        'Sigla Provincia',
-        'Codice ISTAT Comune',
-        'Codice Catastale Comune',
-        'Sezione',
-        'Codice Amministrativo Comune',
-        'Comune',
-        'Fascia',
-        'Zona',
-        'Link Zona',
-        'Codice Tipologia',
-        'Tipologia',
-        'Stato conservativo',
-        'Stato conservativo prevalente',
-        'Prezzo minimo di compravendita',
-        'Prezzo massimo di compravendita',
-        'Superficie non locale compravendita',
-        'Canone minimo di locazione',
-        'Canone massimo di locazione',
-        'Superficie non locale locazione',
-    ]
-    renamed_columns = {
-        'Area_territoriale': 'Area territoriale',
-        'Prov': 'Sigla Provincia',
-        'Comune_ISTAT': 'Codice ISTAT Comune',
-        'Comune_cat': 'Codice Catastale Comune',
-        'Sez': 'Sezione',
-        'Comune_amm': 'Codice Amministrativo Comune',
-        'Comune_descrizione': 'Comune',
-        'LinkZona': 'Link Zona',
-        'Cod_Tip': 'Codice Tipologia',
-        'Descr_Tipologia': 'Tipologia',
-        'Stato': 'Stato conservativo',
-        'Stato_prev': 'Stato conservativo prevalente',
-        'Compr_min': 'Prezzo minimo di compravendita',
-        'Compr_max': 'Prezzo massimo di compravendita',
-        'Sup_NL_compr': 'Superficie non locale compravendita',
-        'Loc_min': 'Canone minimo di locazione',
-        'Loc_max': 'Canone massimo di locazione',
-        'Sup_NL_loc': 'Superficie non locale locazione',
-    }
-
-    year = str(year)
-    target_region = _normalize_text(region)
-    omi = pd.read_csv(
-        DATA + f'omi/{year}/quotazioni.csv',
-        sep=';',
-        encoding='latin1',
-        low_memory=False,
-        dtype={
-            'Area_territoriale': 'string',
-            'Regione': 'string',
-            'Prov': 'string',
-            'Comune_ISTAT': 'string',
-            'Comune_cat': 'string',
-            'Sez': 'string',
-            'Comune_amm': 'string',
-            'Comune_descrizione': 'string',
-            'Fascia': 'string',
-            'Zona': 'string',
-            'LinkZona': 'string',
-            'Cod_Tip': 'string',
-            'Descr_Tipologia': 'string',
-            'Stato': 'string',
-            'Stato_prev': 'string',
-            'Sup_NL_compr': 'string',
-            'Sup_NL_loc': 'string',
-        },
-    )
-
-    omi = omi.drop(columns=[col for col in omi.columns if not str(col).strip() or str(col).startswith('Unnamed:')], errors='ignore')
-    omi = omi.rename(columns=renamed_columns)
-
-    for column in [
-        'Area territoriale',
-        'Regione',
-        'Sigla Provincia',
-        'Codice ISTAT Comune',
-        'Codice Catastale Comune',
-        'Sezione',
-        'Codice Amministrativo Comune',
-        'Comune',
-        'Fascia',
-        'Zona',
-        'Link Zona',
-        'Codice Tipologia',
-        'Tipologia',
-        'Stato conservativo',
-        'Stato conservativo prevalente',
-        'Superficie non locale compravendita',
-        'Superficie non locale locazione',
-    ]:
-        if column in omi.columns:
-            omi[column] = omi[column].astype('string').str.strip()
-
-    if 'Regione' in omi.columns:
-        omi['Regione'] = omi['Regione'].str.title()
-        omi = omi[omi['Regione'].map(_normalize_text) == target_region]
-
-    if 'Codice ISTAT Comune' in omi.columns:
-        omi['Codice ISTAT Comune'] = omi['Codice ISTAT Comune'].str.zfill(7)
-
-    for column in ['Codice Catastale Comune', 'Codice Amministrativo Comune', 'Sigla Provincia']:
-        if column in omi.columns:
-            omi[column] = omi[column].str.upper()
-
-    for column in [
-        'Prezzo minimo di compravendita',
-        'Prezzo massimo di compravendita',
-        'Canone minimo di locazione',
-        'Canone massimo di locazione',
-    ]:
-        if column in omi.columns:
-            omi[column] = pd.to_numeric(omi[column].astype('string').str.replace(',', '.', regex=False), errors='coerce')
-
-    remaining_columns = [column for column in omi.columns if column not in canonical_columns]
-    return omi.reindex(columns=canonical_columns + remaining_columns)
-
-
-def read_geodata(region: str = 'Lombardia') -> gpd.GeoDataFrame:
-    renamed_columns = {
-        'nome_reg': 'Regione',
-        'sig_pro': 'Sigla Provincia',
-        'nome_pro': 'Provincia',
-        'nome_com': 'Comune',
-        'belfiore': 'Codice catastale',
-        'cod_istatn': 'Codice ISTAT Comune esteso',
-        'istat': 'Codice ISTAT Comune',
-    }
-
-    geo = gpd.read_file(DATA + 'limiti_comunali_2020.geojson')
-    geo = geo.drop(columns='anno', errors='ignore')
-    geo = geo.rename(columns=renamed_columns)
-
-    for column in ['Regione', 'Sigla Provincia', 'Provincia', 'Comune', 'Codice catastale']:
-        if column in geo.columns:
-            geo[column] = geo[column].astype('string').str.strip()
-
-    if 'Regione' in geo.columns:
-        geo['Regione'] = geo['Regione'].str.title()
-        geo = geo[geo['Regione'].map(_normalize_text) == _normalize_text(region)]
-
-    if 'Codice catastale' in geo.columns:
-        geo['Codice catastale'] = geo['Codice catastale'].str.upper()
-
-    if 'Codice ISTAT Comune' in geo.columns:
-        geo['Codice ISTAT Comune'] = geo['Codice ISTAT Comune'].astype('string').str.zfill(6)
-
-    if 'Codice ISTAT Comune esteso' in geo.columns:
-        geo['Codice ISTAT Comune esteso'] = geo['Codice ISTAT Comune esteso'].astype('string').str.zfill(8)
-
-    return geo
-
-
-def _normalize_years(years: int | str | list | tuple | set) -> list[str]:
-    if isinstance(years, (list, tuple, set)):
-        return [str(year) for year in years]
-    return [str(years)]
-
-
-def _belfiore(series: pd.Series) -> pd.Series:
-    return series.astype('string').str.strip().str.upper()
-
-
-def _prepare_redditi_for_merge(region: str = 'Lombardia') -> pd.DataFrame:
-    redd = read_redditi(year=2021, region=region).copy()
-    redd['avg_income'] = redd['Reddito imponibile - Ammontare in euro'] / redd['Numero contribuenti']
-    redd['belfiore'] = _belfiore(redd['Codice catastale'])
-    return redd
-
-
-def _prepare_omi_for_merge(region: str = 'Lombardia') -> pd.DataFrame:
-    omi = read_omi(year=2021, region=region).copy()
-    omi['price_m2'] = omi[['Prezzo minimo di compravendita', 'Prezzo massimo di compravendita']].mean(axis=1)
-    omi['rent_m2'] = omi[['Canone minimo di locazione', 'Canone massimo di locazione']].mean(axis=1)
-    omi['belfiore'] = _belfiore(omi['Codice Amministrativo Comune'])
-    omi_muni = (
-        omi.groupby('belfiore', dropna=False)
-        .agg(
-            price_m2=('price_m2', 'mean'),
-            rent_m2=('rent_m2', 'mean'),
-            n_quotes=('price_m2', 'size'),
-        )
+def summarize_correlations(corr: pd.DataFrame, top_n: int = 10, value_name: str = 'correlation') -> pd.DataFrame:
+    pairs = (
+        corr.where(~np.eye(len(corr), dtype=bool))
+        .stack()
         .reset_index()
+        .rename(columns={'level_0': 'var_1', 'level_1': 'var_2', 0: value_name})
     )
-    return omi_muni
+    pairs['pair_key'] = pairs.apply(lambda row: tuple(sorted((row['var_1'], row['var_2']))), axis=1)
+    pairs = pairs.drop_duplicates('pair_key').drop(columns='pair_key')
+    pairs['abs_r'] = pairs[value_name].abs()
+    return pairs.sort_values('abs_r', ascending=False).head(top_n)
 
 
-def _prepare_population_2021_for_merge(region: str = 'Lombardia') -> pd.DataFrame:
-    geo = read_geodata(region=region).copy()
-    census = gpd.read_file(DATA + 'census_lom.gpkg')[['TOT_P_2021', 'geometry']].copy()
-    census['TOT_P_2021'] = pd.to_numeric(census['TOT_P_2021'], errors='coerce').fillna(0)
-    census = census[census['TOT_P_2021'] > 0]
+def fit_binomial_model(
+    analysis_df: pd.DataFrame,
+    predictors: list[str],
+    model_name: str,
+) -> tuple[sm.GLM, pd.DataFrame]:
+    model_df = analysis_df[['yes_votes', 'valid_votes', 'referendum_yes'] + predictors].dropna().copy()
+    for column in ['yes_votes', 'valid_votes', 'referendum_yes'] + predictors:
+        model_df[column] = pd.to_numeric(model_df[column], errors='coerce')
+    model_df = model_df.dropna()
+    X = sm.add_constant(model_df[predictors], has_constant='add').astype(float)
+    y = model_df['referendum_yes'].astype(float)
+    weights = model_df['valid_votes'].astype(float)
 
-    geo_3035 = geo[['Codice catastale', 'geometry']].to_crs(census.crs)
-    census_points = census.copy()
-    census_points['geometry'] = census_points.geometry.representative_point()
+    result = sm.GLM(
+        y,
+        X,
+        family=sm.families.Binomial(),
+        freq_weights=weights,
+    ).fit()
 
-    population = gpd.sjoin(
-        census_points,
-        geo_3035,
-        how='inner',
-        predicate='within',
-    )
-    population = (
-        population.groupby('Codice catastale', dropna=False)
-        .agg(population_2021=('TOT_P_2021', 'sum'))
-        .reset_index()
-    )
-    population['belfiore'] = _belfiore(population['Codice catastale'])
-    return population[['belfiore', 'population_2021']]
+    coef_table = result.summary2().tables[1].reset_index().rename(columns={'index': 'term'})
+    coef_table.insert(0, 'model', model_name)
+    coef_table['n_municipalities'] = len(model_df)
+    coef_table['valid_votes_sum'] = model_df['valid_votes'].sum()
+    return result, coef_table
 
 
-def merge_geodata_omi_redditi_2021(region: str = 'Lombardia') -> gpd.GeoDataFrame:
-    geo = read_geodata(region=region).copy()
-    geo['belfiore'] = _belfiore(geo['Codice catastale'])
-    redd = _prepare_redditi_for_merge(region=region)
-    omi_muni = _prepare_omi_for_merge(region=region)
-    population = _prepare_population_2021_for_merge(region=region)
-
-    merged = geo.merge(
-        redd[
-            [
-                'belfiore',
-                'Denominazione Comune',
-                'Sigla Provincia',
-                'Numero contribuenti',
-                'avg_income',
-                'Reddito imponibile - Ammontare in euro',
-                'Anno di imposta',
-                'Codice Istat Comune',
-                'Codice Istat Regione',
-            ]
+def fit_binomial_models(analysis_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    model_specs = {
+        'binomial_income': ['avg_income'],
+        'binomial_house_price': ['house_price_m2'],
+        'binomial_house_rent': ['house_rent_m2'],
+        'binomial_distance_milano': ['distance_to_milano_km'],
+        'binomial_center_right': ['center_right'],
+        'binomial_center_left': ['center_left'],
+        'binomial_m5s': ['m5s'],
+        'binomial_third_pole': ['third_pole'],
+        'binomial_socioeconomic': ['avg_income', 'house_price_m2', 'house_rent_m2', 'distance_to_milano_km'],
+        'binomial_political_economic': [
+            'center_right',
+            'center_left',
+            'm5s',
+            'third_pole',
+            'avg_income',
+            'house_price_m2',
+            'house_rent_m2',
+            'distance_to_milano_km',
         ],
-        on='belfiore',
-        how='left',
-        suffixes=('_geo', '_redditi'),
-    )
-    merged = merged.merge(omi_muni, on='belfiore', how='left')
-    merged = merged.merge(population, on='belfiore', how='left')
-    merged['Anno'] = 2021
-    merged['OMI Anno'] = 2021
-    return gpd.GeoDataFrame(merged, geometry='geometry', crs=geo.crs)
+    }
 
+    coef_tables = []
+    fit_summaries = []
 
-def merge_geodata_omi_redditi(
-    year: int | str | list | tuple | set = 2021,
-    region: str = 'Lombardia',
-    omi_year: int | str | None = None,
-) -> gpd.GeoDataFrame:
-    year_values = _normalize_years(year)
-    omi_year_value = str(omi_year) if omi_year is not None else '2021'
-    if year_values != ['2021'] or omi_year_value != '2021':
-        raise ValueError('Esta função agora replica o notebook apenas para 2021. Use year=2021 e omi_year=2021.')
-    return merge_geodata_omi_redditi_2021(region=region)
-
-
-def merge_referendum2026_with_merged_df(
-    merged_df: pd.DataFrame | gpd.GeoDataFrame,
-    region: str = 'Lombardia',
-) -> pd.DataFrame | gpd.GeoDataFrame:
-    referendum = read_referendum2026(region=region).copy()
-    merged = merged_df.copy()
-
-    if 'Codice ISTAT Comune_geo' in merged.columns:
-        merge_key = 'Codice ISTAT Comune_geo'
-    elif 'Codice Istat Comune' in merged.columns:
-        merge_key = 'Codice Istat Comune'
-    elif 'Codice ISTAT Comune' in merged.columns:
-        merge_key = 'Codice ISTAT Comune'
-    else:
-        raise KeyError(
-            "merged_df precisa ter uma das colunas 'Codice ISTAT Comune_geo', "
-            "'Codice Istat Comune' ou 'Codice ISTAT Comune' para o merge com referendum2026."
+    for model_name, predictors in model_specs.items():
+        result, coef_table = fit_binomial_model(analysis_df, predictors, model_name)
+        coef_tables.append(coef_table)
+        fit_summaries.append(
+            {
+                'model': model_name,
+                'predictors': ', '.join(predictors),
+                'n_parameters': len(result.params),
+                'log_likelihood': result.llf,
+                'aic': result.aic,
+                'bic_llf': result.bic_llf,
+                'deviance': result.deviance,
+                'pearson_chi2': result.pearson_chi2,
+                'pseudo_r2_mcfadden': result.pseudo_rsquared(kind='mcf'),
+            }
         )
 
-    merged[merge_key] = merged[merge_key].astype('string').str.zfill(6)
-    referendum['Codice Istat Comune'] = referendum['Codice Istat Comune'].astype('string').str.zfill(6)
+    return pd.concat(coef_tables, ignore_index=True), pd.DataFrame(fit_summaries)
 
-    output = merged.merge(
-        referendum[
-            [
-                'Codice Istat Comune',
-                'Perc voti si',
-                'Perc voti no',
-            ]
-        ],
-        how='left',
-        left_on=merge_key,
-        right_on='Codice Istat Comune',
-        suffixes=('', '_referendum'),
+
+def run_analysis(region: str = 'Lombardia') -> pd.DataFrame:
+    analysis_df = build_analysis_df(region=region)
+    pearson_corr = plot_correlation_triangle(
+        analysis_df=analysis_df,
+        columns=PLOT_COLUMNS,
+        output_path=OUTPUT_DIR / 'correlation_triangle.png',
+        method='pearson',
+        title='Triangular Correlation Matrix - Pearson',
+        cbar_label='Pearson r',
+    )
+    spearman_corr = plot_correlation_triangle(
+        analysis_df=analysis_df,
+        columns=PLOT_COLUMNS,
+        output_path=OUTPUT_DIR / 'spearman_correlation_triangle.png',
+        method='spearman',
+        title='Triangular Correlation Matrix - Spearman',
+        cbar_label='Spearman rho',
+    )
+    plot_regression_triangle(
+        analysis_df=analysis_df,
+        columns=PLOT_COLUMNS,
+        output_path=OUTPUT_DIR / 'regression_triangle.png',
     )
 
-    if isinstance(merged_df, gpd.GeoDataFrame):
-        return gpd.GeoDataFrame(output, geometry=merged_df.geometry.name, crs=merged_df.crs)
-    return output
-
-
-def merge_geodata_omi_redditi_referendum2026(
-    year: int | str | list | tuple | set,
-    region: str = 'Lombardia',
-) -> pd.DataFrame | gpd.GeoDataFrame:
-    merged_df = merge_geodata_omi_redditi(year=year, region=region)
-    return merge_referendum2026_with_merged_df(merged_df=merged_df, region=region)
-
-
-def merge_camera2022_with_merged_df(
-    merged_df: pd.DataFrame | gpd.GeoDataFrame,
-    region: str = 'Lombardia',
-) -> pd.DataFrame | gpd.GeoDataFrame:
-    camera = read_camera2022(region=region).copy()
-    merged = merged_df.copy()
-
-    if 'Codice Istat Comune' in merged.columns:
-        merge_key = 'Codice Istat Comune'
-    elif 'Codice ISTAT Comune' in merged.columns:
-        merge_key = 'Codice ISTAT Comune'
-    else:
-        raise KeyError(
-            "merged_df precisa ter uma das colunas 'Codice Istat Comune' ou 'Codice ISTAT Comune' para o merge com camera2022."
-        )
-
-    merged[merge_key] = merged[merge_key].astype('string').str.zfill(6)
-    camera['Codice Istat Comune'] = camera['Codice Istat Comune'].astype('string').str.zfill(6)
-    output = merged.merge(
-        camera,
-        how='left',
-        left_on=merge_key,
-        right_on='Codice Istat Comune',
-        suffixes=('', '_camera2022'),
+    analysis_df.to_excel(OUTPUT_DIR / 'analysis_dataset.xlsx', index=False)
+    top_pearson = summarize_correlations(pearson_corr, value_name='pearson_r')
+    top_pearson.to_csv(OUTPUT_DIR / 'top_correlations.csv', index=False)
+    pearson_corr.to_csv(OUTPUT_DIR / 'pearson_correlation_matrix.csv')
+    top_spearman = summarize_correlations(spearman_corr, value_name='spearman_rho')
+    top_spearman.to_csv(OUTPUT_DIR / 'top_spearman_correlations.csv', index=False)
+    spearman_corr.to_csv(OUTPUT_DIR / 'spearman_correlation_matrix.csv')
+    binomial_coefficients, binomial_model_fit = fit_binomial_models(analysis_df)
+    binomial_coefficients.to_csv(OUTPUT_DIR / 'binomial_model_coefficients.csv', index=False)
+    binomial_model_fit.to_csv(OUTPUT_DIR / 'binomial_model_fit_summary.csv', index=False)
+    excel_output_path = write_excel_with_fallback(
+        {
+            'coefficients': binomial_coefficients,
+            'fit_summary': binomial_model_fit,
+        },
+        OUTPUT_DIR / 'binomial_model_results.xlsx',
     )
+    plot_gini_bootstrap(
+        analysis_df=analysis_df,
+        output_path=OUTPUT_DIR / 'gini_bootstrap_histogram.png',
+        summary_path=OUTPUT_DIR / 'gini_bootstrap_summary.csv',
+    )
+    print(f'Binomial Excel export: {excel_output_path}')
+    return analysis_df
 
-    if isinstance(merged_df, gpd.GeoDataFrame):
-        return gpd.GeoDataFrame(output, geometry=merged_df.geometry.name, crs=merged_df.crs)
-    return output
 
+#%%
+if __name__ == '__main__':
+    analysis_df = run_analysis()
+    print(analysis_df[PLOT_COLUMNS].describe().round(3))
 
-def merge_geodata_omi_redditi_votes_2021(region: str = 'Lombardia') -> pd.DataFrame | gpd.GeoDataFrame:
-    merged_df = merge_geodata_omi_redditi_2021(region=region)
-    merged_df = merge_referendum2026_with_merged_df(merged_df=merged_df, region=region)
-    return merge_camera2022_with_merged_df(merged_df=merged_df, region=region)
-
-# %%
-def concat_redditi(years):
-    dfs = [read_redditi(year) for year in years]
-    return pd.concat(dfs, axis=0)
-
-def concat_omi(years):
-    dfs = [read_omi(year) for year in years]
-    return pd.concat(dfs, axis=0)
-
-# %%
-df = merge_geodata_omi_redditi_votes_2021()
-df.head()
-
-# %%
-ax = df.plot(
-    column='avg_income',
-    cmap='Blues',
-    figsize=(10, 10),
-    legend=True,
-    edgecolor='white',
-    linewidth=0.2,
-    missing_kwds={'color': '#f2f2f2'}
-)
-ax.set_axis_off()
-plt.tight_layout()
-
-# %%
-df.drop(columns=['geometry']).to_excel('data/dados.xlsx')
-
-# %%
-dfx = df.drop(columns=['geometry'])
-
-# %%
+#%%
