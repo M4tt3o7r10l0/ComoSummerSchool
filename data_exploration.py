@@ -289,6 +289,18 @@ def read_camera2022(region: str = 'Lombardia') -> pd.DataFrame:
             except (ValueError, TypeError):
                 pass
 
+    numeric_columns = [
+        column for column in camera.columns
+        if column not in {'COMUNE', 'COMUNE_clean', 'Comune', 'Comune ISTAT lookup', '_comune_key'}
+        and pd.api.types.is_numeric_dtype(camera[column])
+    ]
+    camera = (
+        camera.groupby('Comune ISTAT lookup', as_index=False)[numeric_columns]
+        .sum(min_count=1)
+    )
+    camera['Comune'] = camera['Comune ISTAT lookup']
+    camera['_comune_key'] = camera['Comune ISTAT lookup'].map(_normalize_join_key)
+
     istat = read_istat_codes(region=region).copy()
     istat['_comune_key'] = istat['Comune'].map(_normalize_join_key)
     camera = camera.merge(
@@ -307,9 +319,24 @@ def read_camera2022(region: str = 'Lombardia') -> pd.DataFrame:
         column for column in camera.columns
         if column not in excluded_columns
         and column not in coalition_columns
+        and not any(column == f'{coalition}_PERC' for coalition in coalition_columns)
         and not column.endswith('_PERC')
         and column not in {'Comune', 'Comune ISTAT lookup', '_comune_key', 'Codice Istat Comune', 'Codice catastale'}
     ]
+    total_votes = camera['TOT_VOTI_LISTA'].replace({0: np.nan}) if 'TOT_VOTI_LISTA' in camera.columns else pd.Series(np.nan, index=camera.index)
+
+    coalition_pct_columns = []
+    for column in coalition_columns:
+        new_pct_column = f'Perc voti coalizione - {column}'
+        camera[new_pct_column] = camera[column] / total_votes
+        coalition_pct_columns.append(new_pct_column)
+
+    party_pct_columns = []
+    for column in party_columns:
+        new_pct_column = f'Perc voti partito - {column}'
+        camera[new_pct_column] = camera[column] / total_votes
+        party_pct_columns.append(new_pct_column)
+
     renamed_columns = {column: f'Voti partito - {column}' for column in party_columns}
     renamed_columns.update({column: f'Voti coalizione - {column}' for column in coalition_columns})
     camera = camera.rename(columns=renamed_columns)
@@ -317,7 +344,9 @@ def read_camera2022(region: str = 'Lombardia') -> pd.DataFrame:
     keep_columns = (
         ['Comune', 'Codice Istat Comune', 'Codice catastale', 'VOTANTITOT']
         + [renamed_columns[column] for column in coalition_columns]
+        + coalition_pct_columns
         + [renamed_columns[column] for column in party_columns]
+        + party_pct_columns
     )
     camera = camera.rename(columns={'VOTANTITOT': 'Votanti totali politiche 2022'})
     keep_columns[3] = 'Votanti totali politiche 2022'
@@ -515,11 +544,37 @@ def _prepare_omi_for_merge(region: str = 'Lombardia') -> pd.DataFrame:
     return omi_muni
 
 
+def _prepare_population_2021_for_merge(region: str = 'Lombardia') -> pd.DataFrame:
+    geo = read_geodata(region=region).copy()
+    census = gpd.read_file(DATA + 'census_lom.gpkg')[['TOT_P_2021', 'geometry']].copy()
+    census['TOT_P_2021'] = pd.to_numeric(census['TOT_P_2021'], errors='coerce').fillna(0)
+    census = census[census['TOT_P_2021'] > 0]
+
+    geo_3035 = geo[['Codice catastale', 'geometry']].to_crs(census.crs)
+    census_points = census.copy()
+    census_points['geometry'] = census_points.geometry.representative_point()
+
+    population = gpd.sjoin(
+        census_points,
+        geo_3035,
+        how='inner',
+        predicate='within',
+    )
+    population = (
+        population.groupby('Codice catastale', dropna=False)
+        .agg(population_2021=('TOT_P_2021', 'sum'))
+        .reset_index()
+    )
+    population['belfiore'] = _belfiore(population['Codice catastale'])
+    return population[['belfiore', 'population_2021']]
+
+
 def merge_geodata_omi_redditi_2021(region: str = 'Lombardia') -> gpd.GeoDataFrame:
     geo = read_geodata(region=region).copy()
     geo['belfiore'] = _belfiore(geo['Codice catastale'])
     redd = _prepare_redditi_for_merge(region=region)
     omi_muni = _prepare_omi_for_merge(region=region)
+    population = _prepare_population_2021_for_merge(region=region)
 
     merged = geo.merge(
         redd[
@@ -540,6 +595,7 @@ def merge_geodata_omi_redditi_2021(region: str = 'Lombardia') -> gpd.GeoDataFram
         suffixes=('_geo', '_redditi'),
     )
     merged = merged.merge(omi_muni, on='belfiore', how='left')
+    merged = merged.merge(population, on='belfiore', how='left')
     merged['Anno'] = 2021
     merged['OMI Anno'] = 2021
     return gpd.GeoDataFrame(merged, geometry='geometry', crs=geo.crs)
@@ -667,5 +723,11 @@ ax = df.plot(
 )
 ax.set_axis_off()
 plt.tight_layout()
+
+# %%
+df.drop(columns=['geometry']).to_excel('data/dados.xlsx')
+
+# %%
+dfx = df.drop(columns=['geometry'])
 
 # %%
