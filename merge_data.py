@@ -323,7 +323,7 @@ def read_camera2022(region: str = 'Lombardia') -> pd.DataFrame:
     camera = camera.rename(columns=renamed_columns)
 
     keep_columns = (
-        ['Comune', 'Codice Istat Comune', 'Codice catastale', 'VOTANTITOT', 'AFFLUENZA', 'AFFLUENZA_M', 'AFFLUENZA_F']
+        ['Comune', 'Codice Istat Comune', 'Codice catastale', 'VOTANTITOT', 'TOT_VOTI_LISTA', 'AFFLUENZA', 'AFFLUENZA_M', 'AFFLUENZA_F']
         + [renamed_columns[column] for column in coalition_columns]
         + coalition_pct_columns
         + [renamed_columns[column] for column in party_columns]
@@ -332,15 +332,17 @@ def read_camera2022(region: str = 'Lombardia') -> pd.DataFrame:
     camera = camera.rename(
         columns={
             'VOTANTITOT': 'Votanti totali politiche 2022',
+            'TOT_VOTI_LISTA': 'Voti lista totali politiche 2022',
             'AFFLUENZA': 'Affluenza politiche 2022',
             'AFFLUENZA_M': 'Affluenza politiche 2022 male',
             'AFFLUENZA_F': 'Affluenza politiche 2022 female',
         }
     )
     keep_columns[3] = 'Votanti totali politiche 2022'
-    keep_columns[4] = 'Affluenza politiche 2022'
-    keep_columns[5] = 'Affluenza politiche 2022 male'
-    keep_columns[6] = 'Affluenza politiche 2022 female'
+    keep_columns[4] = 'Voti lista totali politiche 2022'
+    keep_columns[5] = 'Affluenza politiche 2022'
+    keep_columns[6] = 'Affluenza politiche 2022 male'
+    keep_columns[7] = 'Affluenza politiche 2022 female'
     return camera[keep_columns]
 
 #%%

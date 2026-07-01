@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import statsmodels.api as sm
+from statsmodels.iolib.summary2 import summary_col
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 from merge_data import merge_geodata_omi_redditi_votes_2021
 
@@ -20,6 +22,8 @@ sns.set_theme(style='white', context='notebook')
 ANALYSIS_COLUMNS = {
     'Voti si': 'yes_votes',
     'Voti validi': 'valid_votes',
+    'Voti coalizione - CENTRODESTRA': 'center_right_votes',
+    'Voti lista totali politiche 2022': 'valid_votes_politiche_2022',
     'Affluenza referendum 2026': 'turnout_referendum_2026',
     'Affluenza politiche 2022': 'turnout_politiche_2022',
     'Affluenza politiche 2022 male': 'turnout_politiche_2022_male',
@@ -74,6 +78,37 @@ DISPLAY_LABELS = {
     'distance_to_milano_km': 'dist_milan_km',
 }
 
+MODEL_LABELS = {
+    'income': 'Income',
+    'house_price': 'House price',
+    'house_rent': 'House rent',
+    'distance_milano': 'Distance Milan',
+    'turnout_ref26': 'Turnout ref26',
+    'turnout_pol22': 'Turnout pol22',
+    'turnout_male22': 'Turnout male22',
+    'turnout_female22': 'Turnout female22',
+    'socioeconomic': 'Socioeconomic',
+    'income_rent_turnout2026': 'Income + rent + turnout2026',
+    'socioeconomic_turnout': 'Socioeconomic + turnout',
+    'income_rent_turnout': 'Income + rent + turnout',
+}
+
+TERM_LABELS = {
+    'const': 'Intercept',
+    'avg_income_z': 'Average income (z)',
+    'house_price_m2_z': 'House price/m2 (z)',
+    'house_rent_m2_z': 'House rent/m2 (z)',
+    'distance_to_milano_km_z': 'Distance to Milan (z)',
+    'center_right': 'Center right vote share',
+    'center_left': 'Center left vote share',
+    'm5s': 'M5S vote share',
+    'third_pole': 'Third pole vote share',
+    'turnout_referendum_2026_z': 'Turnout ref26 (z)',
+    'turnout_politiche_2022_z': 'Turnout pol22 (z)',
+    'turnout_politiche_2022_male_z': 'Turnout male22 (z)',
+    'turnout_politiche_2022_female_z': 'Turnout female22 (z)',
+}
+
 
 def build_analysis_df(region: str = 'Lombardia') -> pd.DataFrame:
     df = merge_geodata_omi_redditi_votes_2021(region=region).copy()
@@ -82,8 +117,35 @@ def build_analysis_df(region: str = 'Lombardia') -> pd.DataFrame:
     keep_columns = ['Comune'] + list(ANALYSIS_COLUMNS.values())
     analysis_df = df[keep_columns].copy()
     analysis_df = analysis_df.dropna(subset=PLOT_COLUMNS)
-    analysis_df = analysis_df[analysis_df['valid_votes'] > 0].copy()
+    analysis_df = analysis_df[
+        (analysis_df['valid_votes'] > 0)
+        & (analysis_df['valid_votes_politiche_2022'] > 0)
+    ].copy()
     return analysis_df
+
+
+def add_standardized_model_columns(analysis_df: pd.DataFrame) -> pd.DataFrame:
+    standardized_df = analysis_df.copy()
+    columns_to_standardize = [
+        'avg_income',
+        'house_price_m2',
+        'house_rent_m2',
+        'distance_to_milano_km',
+        'turnout_referendum_2026',
+        'turnout_politiche_2022',
+        'turnout_politiche_2022_male',
+        'turnout_politiche_2022_female',
+    ]
+
+    for column in columns_to_standardize:
+        series = pd.to_numeric(standardized_df[column], errors='coerce')
+        std = series.std()
+        if pd.isna(std) or std == 0:
+            standardized_df[f'{column}_z'] = np.nan
+        else:
+            standardized_df[f'{column}_z'] = (series - series.mean()) / std
+
+    return standardized_df
 
 
 def write_excel_with_fallback(sheets: dict[str, pd.DataFrame], output_path: Path) -> Path:
@@ -242,16 +304,19 @@ def summarize_correlations(corr: pd.DataFrame, top_n: int = 10, value_name: str 
 
 def fit_binomial_model(
     analysis_df: pd.DataFrame,
+    success_column: str,
+    proportion_column: str,
+    weight_column: str,
     predictors: list[str],
     model_name: str,
 ) -> tuple[sm.GLM, pd.DataFrame]:
-    model_df = analysis_df[['yes_votes', 'valid_votes', 'referendum_yes'] + predictors].dropna().copy()
-    for column in ['yes_votes', 'valid_votes', 'referendum_yes'] + predictors:
+    model_df = analysis_df[[success_column, weight_column, proportion_column] + predictors].dropna().copy()
+    for column in [success_column, weight_column, proportion_column] + predictors:
         model_df[column] = pd.to_numeric(model_df[column], errors='coerce')
     model_df = model_df.dropna()
     X = sm.add_constant(model_df[predictors], has_constant='add').astype(float)
-    y = model_df['referendum_yes'].astype(float)
-    weights = model_df['valid_votes'].astype(float)
+    y = model_df[proportion_column].astype(float)
+    weights = model_df[weight_column].astype(float)
 
     result = sm.GLM(
         y,
@@ -263,42 +328,84 @@ def fit_binomial_model(
     coef_table = result.summary2().tables[1].reset_index().rename(columns={'index': 'term'})
     coef_table.insert(0, 'model', model_name)
     coef_table['n_municipalities'] = len(model_df)
-    coef_table['valid_votes_sum'] = model_df['valid_votes'].sum()
+    coef_table['weight_sum'] = model_df[weight_column].sum()
     return result, coef_table
 
 
-def fit_binomial_models(analysis_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def compute_vif_table(model_df: pd.DataFrame, predictors: list[str], model_name: str) -> pd.DataFrame:
+    X = model_df[predictors].copy()
+    X = X.apply(pd.to_numeric, errors='coerce').dropna().astype(float)
+    vif_table = pd.DataFrame(
+        {
+            'model': model_name,
+            'term': predictors,
+            'vif': [variance_inflation_factor(X.values, i) for i in range(X.shape[1])],
+        }
+    )
+    return vif_table
+
+
+def fit_binomial_models(
+    analysis_df: pd.DataFrame,
+    success_column: str,
+    proportion_column: str,
+    weight_column: str,
+    model_prefix: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, sm.GLM], pd.DataFrame]:
     model_specs = {
-        'binomial_income': ['avg_income'],
-        'binomial_house_price': ['house_price_m2'],
-        'binomial_house_rent': ['house_rent_m2'],
-        'binomial_distance_milano': ['distance_to_milano_km'],
-        'binomial_center_right': ['center_right'],
-        'binomial_center_left': ['center_left'],
-        'binomial_m5s': ['m5s'],
-        'binomial_third_pole': ['third_pole'],
-        'binomial_socioeconomic': ['avg_income', 'house_price_m2', 'house_rent_m2', 'distance_to_milano_km'],
-        'binomial_political_economic': [
-            'center_right',
-            'center_left',
-            'm5s',
-            'third_pole',
-            'avg_income',
-            'house_price_m2',
-            'house_rent_m2',
-            'distance_to_milano_km',
+        'income': ['avg_income_z'],
+        'house_price': ['house_price_m2_z'],
+        'house_rent': ['house_rent_m2_z'],
+        'distance_milano': ['distance_to_milano_km_z'],
+        'turnout_ref26': ['turnout_referendum_2026_z'],
+        'turnout_pol22': ['turnout_politiche_2022_z'],
+        'turnout_male22': ['turnout_politiche_2022_male_z'],
+        'turnout_female22': ['turnout_politiche_2022_female_z'],
+        'socioeconomic': ['avg_income_z', 'house_price_m2_z', 'house_rent_m2_z', 'distance_to_milano_km_z'],
+        'income_rent_turnout2026': [
+            'avg_income_z',
+            'house_rent_m2_z',
+            'turnout_referendum_2026_z',
+        ],
+        'income_rent_turnout': [
+            'avg_income_z',
+            'house_rent_m2_z',
+            'turnout_referendum_2026_z',
+            'turnout_politiche_2022_z',
+        ],
+        'socioeconomic_turnout': [
+            'avg_income_z',
+            'house_price_m2_z',
+            'house_rent_m2_z',
+            'distance_to_milano_km_z',
+            'turnout_referendum_2026_z',
+            'turnout_politiche_2022_z',
+            'turnout_politiche_2022_male_z',
+            'turnout_politiche_2022_female_z',
         ],
     }
 
     coef_tables = []
     fit_summaries = []
+    fitted_models = {}
+    vif_tables = []
 
     for model_name, predictors in model_specs.items():
-        result, coef_table = fit_binomial_model(analysis_df, predictors, model_name)
+        full_model_name = f'{model_prefix}_{model_name}'
+        model_df = analysis_df[[success_column, weight_column, proportion_column] + predictors].dropna().copy()
+        result, coef_table = fit_binomial_model(
+            analysis_df,
+            success_column=success_column,
+            proportion_column=proportion_column,
+            weight_column=weight_column,
+            predictors=predictors,
+            model_name=full_model_name,
+        )
+        fitted_models[full_model_name] = result
         coef_tables.append(coef_table)
         fit_summaries.append(
             {
-                'model': model_name,
+                'model': full_model_name,
                 'predictors': ', '.join(predictors),
                 'n_parameters': len(result.params),
                 'log_likelihood': result.llf,
@@ -309,12 +416,128 @@ def fit_binomial_models(analysis_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
                 'pseudo_r2_mcfadden': result.pseudo_rsquared(kind='mcf'),
             }
         )
+        if len(predictors) > 1:
+            vif_tables.append(compute_vif_table(model_df, predictors, full_model_name))
 
-    return pd.concat(coef_tables, ignore_index=True), pd.DataFrame(fit_summaries)
+    vif_df = pd.concat(vif_tables, ignore_index=True) if vif_tables else pd.DataFrame(columns=['model', 'term', 'vif'])
+    return pd.concat(coef_tables, ignore_index=True), pd.DataFrame(fit_summaries), fitted_models, vif_df
+
+
+def _summary_to_dataframe(summary) -> pd.DataFrame:
+    table = summary.tables[0]
+    if isinstance(table, pd.DataFrame):
+        return table.reset_index().rename(columns={'index': 'term'})
+
+    rows = table.data
+    header = rows[0]
+    body = rows[1:]
+    return pd.DataFrame(body, columns=header)
+
+
+def export_multimodel_summary(
+    fitted_models: dict[str, sm.GLM],
+    model_names: list[str],
+    prefix: str,
+    dependent_variable_label: str,
+    weight_label: str,
+    vif_table: pd.DataFrame | None = None,
+) -> None:
+    selected_models = [fitted_models[name] for name in model_names]
+    selected_labels = []
+    for name in model_names:
+        short_name = name
+        for candidate_prefix in ['referendum_yes_', 'center_right_']:
+            if short_name.startswith(candidate_prefix):
+                short_name = short_name.removeprefix(candidate_prefix)
+                break
+        selected_labels.append(MODEL_LABELS[short_name])
+
+    summary = summary_col(
+        selected_models,
+        stars=True,
+        float_format='%0.4f',
+        model_names=selected_labels,
+        info_dict={
+            'N': lambda x: f"{int(x.nobs)}",
+            'AIC': lambda x: f"{x.aic:.1f}",
+            'Pseudo R2': lambda x: f"{x.pseudo_rsquared(kind='mcf'):.4f}",
+        },
+    )
+
+    summary_df = _summary_to_dataframe(summary)
+    first_col = summary_df.columns[0]
+    summary_df[first_col] = summary_df[first_col].replace(TERM_LABELS)
+
+    header_lines = [
+        f'Dependent variable: {dependent_variable_label}',
+        'Model family: Binomial GLM with logit link',
+        f'Weights: {weight_label}',
+        'Coefficients are on the log-odds scale.',
+        '',
+    ]
+    header_text = '\n'.join(header_lines)
+
+    txt_path = OUTPUT_DIR / f'{prefix}.txt'
+    html_path = OUTPUT_DIR / f'{prefix}.html'
+    png_path = OUTPUT_DIR / f'{prefix}.png'
+    csv_path = OUTPUT_DIR / f'{prefix}.csv'
+
+    vif_text = ''
+    vif_html = ''
+    if vif_table is not None and not vif_table.empty:
+        vif_subset = vif_table[vif_table['model'].isin(model_names)].copy()
+        vif_subset['term'] = vif_subset['term'].replace(TERM_LABELS)
+        if not vif_subset.empty:
+            vif_text = '\n\nVIF by model\n' + vif_subset.to_string(index=False)
+            vif_html = '<h3>VIF by model</h3>' + vif_subset.to_html(index=False)
+
+    txt_path.write_text(header_text + summary.as_text() + vif_text, encoding='utf-8')
+    html_path.write_text(
+        (
+            '<html><head><style>'
+            'body { font-family: Arial, sans-serif; margin: 24px; }'
+            'table { border-collapse: separate; border-spacing: 12px 4px; }'
+            'th, td { padding: 6px 14px; min-width: 120px; text-align: center; }'
+            'th:first-child, td:first-child { min-width: 220px; text-align: left; }'
+            '</style></head><body>'
+            f'<p><strong>Dependent variable:</strong> {dependent_variable_label}<br>'
+            '<strong>Model family:</strong> Binomial GLM with logit link<br>'
+            f'<strong>Weights:</strong> {weight_label}<br>'
+            '<strong>Scale:</strong> coefficients in log-odds</p>'
+            f'{summary.as_html()}'
+            f'{vif_html}'
+            '</body></html>'
+        ),
+        encoding='utf-8',
+    )
+    summary_df.to_csv(csv_path, index=False)
+
+    fig_height = max(4, 0.42 * (len(summary_df) + 2))
+    fig_width = max(10, 2.3 * len(summary_df.columns))
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.axis('off')
+    table = ax.table(
+        cellText=summary_df.values,
+        colLabels=summary_df.columns,
+        loc='center',
+        cellLoc='center',
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.0, 1.25)
+    ax.set_title(
+        prefix.replace('_', ' ').title()
+        + f'\nDependent variable: {dependent_variable_label} | Binomial GLM (logit) | Weights: {weight_label}',
+        pad=18,
+    )
+    plt.tight_layout()
+    fig.savefig(png_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
 
 
 def run_analysis(region: str = 'Lombardia') -> pd.DataFrame:
     analysis_df = build_analysis_df(region=region)
+    model_df = add_standardized_model_columns(analysis_df)
     pearson_corr = plot_correlation_triangle(
         analysis_df=analysis_df,
         columns=PLOT_COLUMNS,
@@ -344,15 +567,66 @@ def run_analysis(region: str = 'Lombardia') -> pd.DataFrame:
     top_spearman = summarize_correlations(spearman_corr, value_name='spearman_rho')
     top_spearman.to_csv(OUTPUT_DIR / 'top_spearman_correlations.csv', index=False)
     spearman_corr.to_csv(OUTPUT_DIR / 'spearman_correlation_matrix.csv')
-    binomial_coefficients, binomial_model_fit = fit_binomial_models(analysis_df)
+    model_df['center_right'] = pd.to_numeric(model_df['center_right'], errors='coerce')
+    model_df['center_right_votes'] = pd.to_numeric(model_df['center_right_votes'], errors='coerce')
+    model_df['valid_votes_politiche_2022'] = pd.to_numeric(model_df['valid_votes_politiche_2022'], errors='coerce')
+
+    referendum_coefficients, referendum_model_fit, referendum_models, referendum_vif = fit_binomial_models(
+        model_df,
+        success_column='yes_votes',
+        proportion_column='referendum_yes',
+        weight_column='valid_votes',
+        model_prefix='referendum_yes',
+    )
+    center_right_coefficients, center_right_model_fit, center_right_models, center_right_vif = fit_binomial_models(
+        model_df,
+        success_column='center_right_votes',
+        proportion_column='center_right',
+        weight_column='valid_votes_politiche_2022',
+        model_prefix='center_right',
+    )
+
+    binomial_coefficients = pd.concat([referendum_coefficients, center_right_coefficients], ignore_index=True)
+    binomial_model_fit = pd.concat([referendum_model_fit, center_right_model_fit], ignore_index=True)
+    fitted_models = {**referendum_models, **center_right_models}
+    binomial_vif = pd.concat([referendum_vif, center_right_vif], ignore_index=True)
+
     binomial_coefficients.to_csv(OUTPUT_DIR / 'binomial_model_coefficients.csv', index=False)
     binomial_model_fit.to_csv(OUTPUT_DIR / 'binomial_model_fit_summary.csv', index=False)
+    binomial_vif.to_csv(OUTPUT_DIR / 'binomial_model_vif.csv', index=False)
     excel_output_path = write_excel_with_fallback(
         {
             'coefficients': binomial_coefficients,
             'fit_summary': binomial_model_fit,
+            'vif': binomial_vif,
         },
         OUTPUT_DIR / 'binomial_model_results.xlsx',
+    )
+    export_multimodel_summary(
+        fitted_models=fitted_models,
+        model_names=[
+            'center_right_income_rent_turnout2026',
+            'center_right_income_rent_turnout',
+            'center_right_socioeconomic',
+            'center_right_socioeconomic_turnout',
+        ],
+        prefix='center_right_models_multivariate_summary',
+        dependent_variable_label='center_right (share of center-right list votes in politiche 2022)',
+        weight_label='valid_votes_politiche_2022 (total list votes in politiche 2022)',
+        vif_table=binomial_vif,
+    )
+    export_multimodel_summary(
+        fitted_models=fitted_models,
+        model_names=[
+            'referendum_yes_income_rent_turnout2026',
+            'referendum_yes_income_rent_turnout',
+            'referendum_yes_socioeconomic',
+            'referendum_yes_socioeconomic_turnout',
+        ],
+        prefix='referendum_yes_models_multivariate_summary',
+        dependent_variable_label='referendum_yes (share of Yes votes in referendum 2026)',
+        weight_label='valid_votes (number of valid referendum votes)',
+        vif_table=binomial_vif,
     )
     plot_gini_bootstrap(
         analysis_df=analysis_df,
