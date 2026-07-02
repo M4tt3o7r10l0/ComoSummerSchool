@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import statsmodels.api as sm
+from sklearn.tree import DecisionTreeRegressor, plot_tree
 from statsmodels.iolib.summary2 import summary_col
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 
@@ -14,6 +15,11 @@ from merge_data import merge_geodata_omi_redditi_votes_2021
 
 OUTPUT_DIR = Path('outputs')
 OUTPUT_DIR.mkdir(exist_ok=True)
+CORR_DIR = OUTPUT_DIR / 'correlation_and_simple_regressions'
+MULTIVAR_DIR = OUTPUT_DIR / 'multivariate_regressions'
+TREE_DIR = OUTPUT_DIR / 'decision_trees'
+for directory in [CORR_DIR, MULTIVAR_DIR, TREE_DIR]:
+    directory.mkdir(exist_ok=True)
 BOOTSTRAP_RANDOM_SEED = 42
 BOOTSTRAP_SAMPLES = 5000
 
@@ -24,6 +30,7 @@ ANALYSIS_COLUMNS = {
     'Voti validi': 'valid_votes',
     'Voti coalizione - CENTRODESTRA': 'center_right_votes',
     'Voti lista totali politiche 2022': 'valid_votes_politiche_2022',
+    'gini_income': 'gini_income',
     'Affluenza referendum 2026': 'turnout_referendum_2026',
     'Affluenza politiche 2022': 'turnout_politiche_2022',
     'Affluenza politiche 2022 male': 'turnout_politiche_2022_male',
@@ -45,6 +52,7 @@ ANALYSIS_COLUMNS = {
 PLOT_COLUMNS = [
     'referendum_yes',
     'referendum_no',
+    'gini_income',
     'turnout_referendum_2026',
     'turnout_politiche_2022',
     'turnout_politiche_2022_male',
@@ -63,6 +71,7 @@ PLOT_COLUMNS = [
 DISPLAY_LABELS = {
     'referendum_yes': 'yes_ref',
     'referendum_no': 'no_ref',
+    'gini_income': 'gini_income',
     'turnout_referendum_2026': 'turnout_ref26',
     'turnout_politiche_2022': 'turnout_pol22',
     'turnout_politiche_2022_male': 'turnout_male22',
@@ -109,9 +118,27 @@ TERM_LABELS = {
     'turnout_politiche_2022_female_z': 'Turnout female22 (z)',
 }
 
+TREE_FEATURES = [
+    'avg_income',
+    'house_rent_m2',
+    'turnout_politiche_2022',
+    'distance_to_milano_km',
+]
+
+TREE_FEATURE_LABELS = {
+    'avg_income': 'Average income',
+    'house_rent_m2': 'House rent/m2',
+    'turnout_politiche_2022': 'Turnout politiche 2022',
+    'distance_to_milano_km': 'Distance to Milan (km)',
+}
+
 
 def build_analysis_df(region: str = 'Lombardia') -> pd.DataFrame:
     df = merge_geodata_omi_redditi_votes_2021(region=region).copy()
+    return build_analysis_df_from_merged(df)
+
+
+def build_analysis_df_from_merged(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns=ANALYSIS_COLUMNS)
 
     keep_columns = ['Comune'] + list(ANALYSIS_COLUMNS.values())
@@ -127,6 +154,8 @@ def build_analysis_df(region: str = 'Lombardia') -> pd.DataFrame:
 def add_standardized_model_columns(analysis_df: pd.DataFrame) -> pd.DataFrame:
     standardized_df = analysis_df.copy()
     columns_to_standardize = [
+        'referendum_yes',
+        'gini_income',
         'avg_income',
         'house_price_m2',
         'house_rent_m2',
@@ -477,10 +506,10 @@ def export_multimodel_summary(
     ]
     header_text = '\n'.join(header_lines)
 
-    txt_path = OUTPUT_DIR / f'{prefix}.txt'
-    html_path = OUTPUT_DIR / f'{prefix}.html'
-    png_path = OUTPUT_DIR / f'{prefix}.png'
-    csv_path = OUTPUT_DIR / f'{prefix}.csv'
+    html_path = MULTIVAR_DIR / f'{prefix}.html'
+    png_path = MULTIVAR_DIR / f'{prefix}.png'
+    csv_path = MULTIVAR_DIR / f'{prefix}.csv'
+    txt_path = MULTIVAR_DIR / f'{prefix}.txt'
 
     vif_text = ''
     vif_html = ''
@@ -535,13 +564,164 @@ def export_multimodel_summary(
     plt.close(fig)
 
 
+def fit_decision_tree(
+    analysis_df: pd.DataFrame,
+    target_column: str,
+    target_label: str,
+    prefix: str,
+    max_depth: int = 3,
+    min_samples_leaf: int = 40,
+) -> pd.DataFrame:
+    tree_df = analysis_df[TREE_FEATURES + [target_column]].copy()
+    tree_df[TREE_FEATURES + [target_column]] = tree_df[TREE_FEATURES + [target_column]].apply(
+        pd.to_numeric, errors='coerce'
+    )
+    tree_df = tree_df.dropna()
+
+    X = tree_df[TREE_FEATURES]
+    y = tree_df[target_column]
+
+    model = DecisionTreeRegressor(
+        max_depth=max_depth,
+        min_samples_leaf=min_samples_leaf,
+        random_state=42,
+    )
+    model.fit(X, y)
+    tree_r2 = model.score(X, y)
+
+    importance_df = pd.DataFrame(
+        {
+            'target': target_column,
+            'feature': TREE_FEATURES,
+            'feature_label': [TREE_FEATURE_LABELS[col] for col in TREE_FEATURES],
+            'importance': model.feature_importances_,
+            'tree_r2': tree_r2,
+        }
+    ).sort_values('importance', ascending=False)
+
+    fig, ax = plt.subplots(figsize=(20, 10))
+    plot_tree(
+        model,
+        feature_names=[TREE_FEATURE_LABELS[col] for col in TREE_FEATURES],
+        filled=True,
+        rounded=True,
+        fontsize=9,
+        ax=ax,
+    )
+    ax.set_title(f'Decision Tree for {target_label}')
+    plt.tight_layout()
+    fig.savefig(TREE_DIR / f'{prefix}_decision_tree.png', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+    importance_df.to_csv(TREE_DIR / f'{prefix}_decision_tree_importance.csv', index=False)
+    (TREE_DIR / f'{prefix}_decision_tree_importance.txt').write_text(
+        f'Target: {target_label}\n'
+        f'Features: {", ".join(TREE_FEATURES)}\n\n'
+        f'R2: {tree_r2:.4f}\n\n'
+        + importance_df[['feature_label', 'importance']].to_string(index=False),
+        encoding='utf-8',
+    )
+    return importance_df
+
+
+def fit_gini_regression(analysis_df: pd.DataFrame) -> tuple[sm.regression.linear_model.RegressionResultsWrapper, pd.DataFrame]:
+    predictors = ['referendum_yes_z', 'avg_income_z', 'house_rent_m2_z', 'turnout_politiche_2022_z']
+    model_df = analysis_df[['gini_income'] + predictors].copy()
+    model_df = model_df.apply(pd.to_numeric, errors='coerce').dropna()
+
+    X = sm.add_constant(model_df[predictors], has_constant='add').astype(float)
+    y = model_df['gini_income'].astype(float)
+    result = sm.OLS(y, X).fit()
+
+    coef_table = result.summary2().tables[1].reset_index().rename(columns={'index': 'term'})
+    coef_table['term'] = coef_table['term'].replace(
+        {
+            'const': 'Intercept',
+            'referendum_yes_z': 'Referendum yes (z)',
+            'avg_income_z': 'Average income (z)',
+            'house_rent_m2_z': 'House rent/m2 (z)',
+            'turnout_politiche_2022_z': 'Turnout politiche 2022 (z)',
+        }
+    )
+    return result, coef_table
+
+
+def export_gini_regression_summary(
+    result: sm.regression.linear_model.RegressionResultsWrapper,
+    coef_table: pd.DataFrame,
+) -> None:
+    summary_text = (
+        'Dependent variable: gini_income (municipal Gini from income brackets)\n'
+        'Model family: OLS\n'
+        'Predictors: referendum_yes_z, avg_income_z, house_rent_m2_z, turnout_politiche_2022_z\n\n'
+        + result.summary().as_text()
+    )
+    (MULTIVAR_DIR / 'gini_regression_summary.txt').write_text(summary_text, encoding='utf-8')
+    coef_table.to_csv(MULTIVAR_DIR / 'gini_regression_coefficients.csv', index=False)
+
+    fig, ax = plt.subplots(figsize=(10, 3 + 0.45 * len(coef_table)))
+    ax.axis('off')
+    table = ax.table(
+        cellText=coef_table.round(4).values,
+        colLabels=coef_table.columns,
+        loc='center',
+        cellLoc='center',
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.0, 1.25)
+    ax.set_title(
+        f'Gini regression | R2 = {result.rsquared:.4f} | Adj. R2 = {result.rsquared_adj:.4f}',
+        pad=18,
+    )
+    plt.tight_layout()
+    fig.savefig(MULTIVAR_DIR / 'gini_regression_summary.png', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_gini_vs_yes_map(merged_gdf: pd.DataFrame) -> None:
+    plot_gdf = merged_gdf.rename(columns=ANALYSIS_COLUMNS).copy()
+    plot_gdf = plot_gdf.to_crs(epsg=4326)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    plot_gdf.plot(
+        column='gini_income',
+        cmap='magma',
+        legend=True,
+        linewidth=0.15,
+        edgecolor='white',
+        missing_kwds={'color': '#f2f2f2'},
+        ax=axes[0],
+    )
+    axes[0].set_title('Municipal Gini coefficient')
+    axes[0].set_axis_off()
+
+    plot_gdf.plot(
+        column='referendum_yes',
+        cmap='viridis',
+        legend=True,
+        linewidth=0.15,
+        edgecolor='white',
+        missing_kwds={'color': '#f2f2f2'},
+        ax=axes[1],
+    )
+    axes[1].set_title('Referendum yes vote share')
+    axes[1].set_axis_off()
+
+    plt.tight_layout()
+    fig.savefig(CORR_DIR / 'gini_vs_referendum_yes_map.png', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
 def run_analysis(region: str = 'Lombardia') -> pd.DataFrame:
-    analysis_df = build_analysis_df(region=region)
+    merged_gdf = merge_geodata_omi_redditi_votes_2021(region=region).copy()
+    merged_gdf.drop(columns=['geometry']).to_excel('data/dados.xlsx', index=False)
+    analysis_df = build_analysis_df_from_merged(merged_gdf)
     model_df = add_standardized_model_columns(analysis_df)
     pearson_corr = plot_correlation_triangle(
         analysis_df=analysis_df,
         columns=PLOT_COLUMNS,
-        output_path=OUTPUT_DIR / 'correlation_triangle.png',
+        output_path=CORR_DIR / 'correlation_triangle.png',
         method='pearson',
         title='Triangular Correlation Matrix - Pearson',
         cbar_label='Pearson r',
@@ -549,7 +729,7 @@ def run_analysis(region: str = 'Lombardia') -> pd.DataFrame:
     spearman_corr = plot_correlation_triangle(
         analysis_df=analysis_df,
         columns=PLOT_COLUMNS,
-        output_path=OUTPUT_DIR / 'spearman_correlation_triangle.png',
+        output_path=CORR_DIR / 'spearman_correlation_triangle.png',
         method='spearman',
         title='Triangular Correlation Matrix - Spearman',
         cbar_label='Spearman rho',
@@ -557,16 +737,16 @@ def run_analysis(region: str = 'Lombardia') -> pd.DataFrame:
     plot_regression_triangle(
         analysis_df=analysis_df,
         columns=PLOT_COLUMNS,
-        output_path=OUTPUT_DIR / 'regression_triangle.png',
+        output_path=CORR_DIR / 'regression_triangle.png',
     )
 
     analysis_df.to_excel(OUTPUT_DIR / 'analysis_dataset.xlsx', index=False)
     top_pearson = summarize_correlations(pearson_corr, value_name='pearson_r')
-    top_pearson.to_csv(OUTPUT_DIR / 'top_correlations.csv', index=False)
-    pearson_corr.to_csv(OUTPUT_DIR / 'pearson_correlation_matrix.csv')
+    top_pearson.to_csv(CORR_DIR / 'top_correlations.csv', index=False)
+    pearson_corr.to_csv(CORR_DIR / 'pearson_correlation_matrix.csv')
     top_spearman = summarize_correlations(spearman_corr, value_name='spearman_rho')
-    top_spearman.to_csv(OUTPUT_DIR / 'top_spearman_correlations.csv', index=False)
-    spearman_corr.to_csv(OUTPUT_DIR / 'spearman_correlation_matrix.csv')
+    top_spearman.to_csv(CORR_DIR / 'top_spearman_correlations.csv', index=False)
+    spearman_corr.to_csv(CORR_DIR / 'spearman_correlation_matrix.csv')
     model_df['center_right'] = pd.to_numeric(model_df['center_right'], errors='coerce')
     model_df['center_right_votes'] = pd.to_numeric(model_df['center_right_votes'], errors='coerce')
     model_df['valid_votes_politiche_2022'] = pd.to_numeric(model_df['valid_votes_politiche_2022'], errors='coerce')
@@ -591,16 +771,16 @@ def run_analysis(region: str = 'Lombardia') -> pd.DataFrame:
     fitted_models = {**referendum_models, **center_right_models}
     binomial_vif = pd.concat([referendum_vif, center_right_vif], ignore_index=True)
 
-    binomial_coefficients.to_csv(OUTPUT_DIR / 'binomial_model_coefficients.csv', index=False)
-    binomial_model_fit.to_csv(OUTPUT_DIR / 'binomial_model_fit_summary.csv', index=False)
-    binomial_vif.to_csv(OUTPUT_DIR / 'binomial_model_vif.csv', index=False)
+    binomial_coefficients.to_csv(MULTIVAR_DIR / 'binomial_model_coefficients.csv', index=False)
+    binomial_model_fit.to_csv(MULTIVAR_DIR / 'binomial_model_fit_summary.csv', index=False)
+    binomial_vif.to_csv(MULTIVAR_DIR / 'binomial_model_vif.csv', index=False)
     excel_output_path = write_excel_with_fallback(
         {
             'coefficients': binomial_coefficients,
             'fit_summary': binomial_model_fit,
             'vif': binomial_vif,
         },
-        OUTPUT_DIR / 'binomial_model_results.xlsx',
+        MULTIVAR_DIR / 'binomial_model_results.xlsx',
     )
     export_multimodel_summary(
         fitted_models=fitted_models,
@@ -628,10 +808,35 @@ def run_analysis(region: str = 'Lombardia') -> pd.DataFrame:
         weight_label='valid_votes (number of valid referendum votes)',
         vif_table=binomial_vif,
     )
+    referendum_tree_importance = fit_decision_tree(
+        analysis_df=analysis_df,
+        target_column='referendum_yes',
+        target_label='referendum_yes',
+        prefix='referendum_yes',
+    )
+    center_right_tree_importance = fit_decision_tree(
+        analysis_df=analysis_df,
+        target_column='center_right',
+        target_label='center_right',
+        prefix='center_right',
+    )
+    gini_tree_importance = fit_decision_tree(
+        analysis_df=analysis_df,
+        target_column='gini_income',
+        target_label='gini_income',
+        prefix='gini_income',
+    )
+    pd.concat([referendum_tree_importance, center_right_tree_importance, gini_tree_importance], ignore_index=True).to_csv(
+        TREE_DIR / 'decision_tree_variable_importance.csv',
+        index=False,
+    )
+    gini_result, gini_coef_table = fit_gini_regression(model_df)
+    export_gini_regression_summary(gini_result, gini_coef_table)
+    plot_gini_vs_yes_map(merged_gdf)
     plot_gini_bootstrap(
         analysis_df=analysis_df,
-        output_path=OUTPUT_DIR / 'gini_bootstrap_histogram.png',
-        summary_path=OUTPUT_DIR / 'gini_bootstrap_summary.csv',
+        output_path=CORR_DIR / 'gini_bootstrap_histogram.png',
+        summary_path=CORR_DIR / 'gini_bootstrap_summary.csv',
     )
     print(f'Binomial Excel export: {excel_output_path}')
     return analysis_df

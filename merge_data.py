@@ -513,9 +513,55 @@ def _belfiore(series: pd.Series) -> pd.Series:
     return series.astype('string').str.strip().str.upper()
 
 
+def _weighted_gini(values: np.ndarray, weights: np.ndarray) -> float:
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    mask = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+    values = values[mask]
+    weights = weights[mask]
+
+    if values.size == 0 or np.allclose(weights.sum(), 0):
+        return np.nan
+
+    order = np.argsort(values)
+    values = values[order]
+    weights = weights[order]
+
+    weighted_values = values * weights
+    cum_weights = np.cumsum(weights)
+    cum_income = np.cumsum(weighted_values)
+
+    total_weight = cum_weights[-1]
+    total_income = cum_income[-1]
+    if np.allclose(total_income, 0):
+        return 0.0
+
+    lorenz_x = np.concatenate(([0.0], cum_weights / total_weight))
+    lorenz_y = np.concatenate(([0.0], cum_income / total_income))
+    area = np.trapezoid(lorenz_y, lorenz_x)
+    return float(1 - 2 * area)
+
+
+def _compute_grouped_income_gini(row: pd.Series) -> float:
+    bracket_values = np.array([0, 5000, 12500, 20500, 40500, 65000, 97500, 150000], dtype=float)
+    bracket_columns = [
+        'Reddito complessivo minore o uguale a zero euro - Frequenza',
+        'Reddito complessivo da 0 a 10000 euro - Frequenza',
+        'Reddito complessivo da 10000 a 15000 euro - Frequenza',
+        'Reddito complessivo da 15000 a 26000 euro - Frequenza',
+        'Reddito complessivo da 26000 a 55000 euro - Frequenza',
+        'Reddito complessivo da 55000 a 75000 euro - Frequenza',
+        'Reddito complessivo da 75000 a 120000 euro - Frequenza',
+        'Reddito complessivo oltre 120000 euro - Frequenza',
+    ]
+    weights = row[bracket_columns].to_numpy(dtype=float, na_value=0.0)
+    return _weighted_gini(bracket_values, weights)
+
+
 def _prepare_redditi_for_merge(region: str = 'Lombardia') -> pd.DataFrame:
     redd = read_redditi(year=2021, region=region).copy()
     redd['avg_income'] = redd['Reddito imponibile - Ammontare in euro'] / redd['Numero contribuenti']
+    redd['gini_income'] = redd.apply(_compute_grouped_income_gini, axis=1)
     redd['belfiore'] = _belfiore(redd['Codice catastale'])
     return redd
 
@@ -594,6 +640,7 @@ def merge_geodata_omi_redditi_2021(region: str = 'Lombardia') -> gpd.GeoDataFram
                 'Sigla Provincia',
                 'Numero contribuenti',
                 'avg_income',
+                'gini_income',
                 'Reddito imponibile - Ammontare in euro',
                 'Anno di imposta',
                 'Codice Istat Comune',
